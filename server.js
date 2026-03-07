@@ -222,6 +222,7 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
     }
 
     // Search Apollo for decision maker at this company
+    console.log("Calling Apollo with key:", apolloKey ? apolloKey.slice(0,8)+"..." : "MISSING");
     const apolloRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
@@ -231,7 +232,11 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
         page: 1, per_page: 1,
       }),
     });
-    const apolloData = await apolloRes.json();
+    const apolloText = await apolloRes.text();
+    console.log("Apollo raw response:", apolloText.slice(0, 300));
+    let apolloData;
+    try { apolloData = JSON.parse(apolloText); } 
+    catch { throw new Error(`Apollo returned non-JSON: ${apolloText.slice(0,200)}`); }
     const person = apolloData.people?.[0];
 
     if (!person) {
