@@ -219,3 +219,5 @@ migrate()
     app.listen(PORT, "0.0.0.0", () => console.log(`✅ HireRadar API running on port ${PORT}`));
   })
   .catch(err => { console.error("❌ Startup failed:", err.message); process.exit(1); });
+
+// REPLACED BY UPDATED VERSION - see below
