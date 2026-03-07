@@ -69,6 +69,9 @@ async function migrate() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    // Add columns if they don't exist (safe migration)
+    await client.query(`ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS apify_run_id TEXT`);
+    await client.query(`ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS params JSONB`);
     console.log("✅ Database tables ready");
   } finally {
     client.release();
