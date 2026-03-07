@@ -114,41 +114,69 @@ app.post("/api/apollo/company", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"];
   if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
   try {
+    const companyName = req.body.company_name;
+
+    // Step 1: Get domain via org search
     const orgRes = await fetch("https://api.apollo.io/v1/mixed_companies/search", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-      body: JSON.stringify({ q_organization_name: req.body.company_name, page: 1, per_page: 1 }),
+      body: JSON.stringify({ q_organization_name: companyName, page: 1, per_page: 1 }),
     });
     const orgData = await orgRes.json();
     const org = orgData.organizations?.[0];
-    if (!org) return res.status(404).json({ error: `Company "${req.body.company_name}" not found on Apollo` });
+    const domain = org?.primary_domain || org?.website_url?.replace(/https?:\/\/(www\.)?/,"").split("/")[0];
+    console.log("apollo/company:", companyName, "→ org:", org?.name, "domain:", domain);
 
-    const peopleRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-      body: JSON.stringify({
-        organization_ids: [org.id],
-        page: 1, per_page: 5,
-      }),
-    });
-    const peopleData = await peopleRes.json();
-    const people = peopleData.people || [];
-    if (!people.length) return res.status(404).json({ error: `No decision makers found at "${req.body.company_name}". Try searching by person name instead.` });
+    // Step 2: people/match by domain + title (most reliable for emails)
+    const titles = ["ceo","founder","co-founder","cto","president","owner","head of engineering","vp of engineering"];
+    let person = null;
+
+    if (domain) {
+      for (const title of titles) {
+        const r = await fetch("https://api.apollo.io/v1/people/match", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+          body: JSON.stringify({ domain, title, reveal_personal_emails: true }),
+        });
+        const d = await r.json();
+        console.log("people/match title:", title, "→", d.person?.first_name || "none", d.person?.email || "no email");
+        if (d.person?.first_name) { person = d.person; break; }
+      }
+    }
+
+    // Step 3: fallback — people/match by org name only
+    if (!person) {
+      const r = await fetch("https://api.apollo.io/v1/people/match", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+        body: JSON.stringify({ organization_name: companyName, reveal_personal_emails: true }),
+      });
+      const d = await r.json();
+      console.log("people/match org fallback →", d.person?.first_name || "none");
+      if (d.person?.first_name) person = d.person;
+    }
+
+    if (!person?.first_name) {
+      return res.status(404).json({ error: `No contact found for "${companyName}" on Apollo` });
+    }
 
     res.json({
-      org: { name: org.name, domain: org.website_url, employees: org.estimated_num_employees },
-      people: people.map(p => ({
-        name: `${p.first_name} ${p.last_name}`,
-        title: p.title || "—",
-        email: p.email,
-        linkedin: p.linkedin_url,
-        verified: !!p.email,
-      })),
+      org: { name: org?.name || companyName, domain, employees: org?.estimated_num_employees },
+      people: [{
+        name: `${person.first_name} ${person.last_name || ""}`.trim(),
+        title: person.title || "—",
+        email: person.email || null,
+        linkedin: person.linkedin_url || null,
+        verified: !!person.email,
+        apollo_id: person.id,
+      }],
     });
   } catch (err) {
+    console.error("apollo/company error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ── Dashboard ─────────────────────────────────────────────────
 app.get("/api/dashboard", async (_req, res) => {
