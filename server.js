@@ -231,6 +231,21 @@ app.post("/api/scrape/run", async (req, res) => {
     // Build search keywords from roles
     const keywords = (roles || ["Software Engineer"]).join(" OR ");
 
+    // Build LinkedIn search URLs from parameters
+    const linkedinUrls = (roles || ["Software Engineer"]).map(role => {
+      const params = new URLSearchParams({
+        keywords: role,
+        location: country || "United States",
+        f_TPR,
+        f_TP: "1",       // Full-time
+        position: "1",
+        pageNum: "0",
+      });
+      return `https://www.linkedin.com/jobs/search/?${params.toString()}`;
+    });
+
+    console.log("LinkedIn URLs:", linkedinUrls);
+
     // Call Apify LinkedIn Jobs Scraper
     const apifyRes = await fetch(
       `https://api.apify.com/v2/acts/curious_coder~linkedin-jobs-scraper/runs?token=${key}`,
@@ -238,21 +253,19 @@ app.post("/api/scrape/run", async (req, res) => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          searchKeywords: keywords,
-          location: country || "United States",
+          startUrls: linkedinUrls,
           count: 50,
-          f_TPR,
-          f_E: "1",       // Entry/Associate (used as proxy for small companies)
+          scrapeCompany: true,
           proxy: { useApifyProxy: true },
         }),
       }
     );
 
     const apifyData = await apifyRes.json();
-    console.log("Apify response:", JSON.stringify(apifyData).slice(0,500));
+    console.log("Apify response:", JSON.stringify(apifyData).slice(0, 500));
 
     if (!apifyRes.ok || apifyData.error) {
-      throw new Error(apifyData.error?.message || apifyData.message || "Apify actor failed to start");
+      throw new Error(apifyData.error?.message || apifyData.message || `Apify error: ${JSON.stringify(apifyData).slice(0,200)}`);
     }
 
     const apifyRunId = apifyData.data?.id || apifyData.id;
@@ -265,7 +278,7 @@ app.post("/api/scrape/run", async (req, res) => {
     const runId = rows[0].id;
 
     // Process results in background
-    processApifyRun(runId, apifyRunId, key, companySize).catch(console.error);
+    processApifyRun(runId, apifyRunId, key, companySize, "curious_coder~linkedin-jobs-scraper").catch(console.error);
 
     res.json({ run_id: runId, apify_run_id: apifyRunId, status: "running" });
 
@@ -280,7 +293,7 @@ app.post("/api/scrape/run", async (req, res) => {
 });
 
 // ── Background: poll Apify and save results ───────────────────
-async function processApifyRun(runId, apifyRunId, apifyKey, companySize) {
+async function processApifyRun(runId, apifyRunId, apifyKey, companySize, actor="curious_coder~linkedin-jobs-scraper") {
   try {
     // Poll until Apify run completes
     let apifyStatus = "RUNNING";
@@ -289,7 +302,7 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize) {
       await new Promise(r => setTimeout(r, 5000));
       attempts++;
       const statusRes = await fetch(
-        `https://api.apify.com/v2/acts/curious_coder~linkedin-jobs-scraper/runs/${apifyRunId}?token=${apifyKey}`
+        `https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${apifyKey}`
       );
       const statusData = await statusRes.json();
       apifyStatus = statusData.data?.status || "FAILED";
@@ -306,7 +319,7 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize) {
 
     // Fetch results from Apify dataset
     const dataRes = await fetch(
-      `https://api.apify.com/v2/acts/curious_coder~linkedin-jobs-scraper/runs/${apifyRunId}/dataset/items?token=${apifyKey}&limit=200`
+      `https://api.apify.com/v2/actor-runs/${apifyRunId}/dataset/items?token=${apifyKey}&limit=200`
     );
     const jobs = await dataRes.json();
     console.log(`Got ${jobs.length} jobs from Apify`);
@@ -322,9 +335,17 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize) {
 
     for (const job of jobs) {
       try {
-        const companyName = job.companyName || job.company || "Unknown";
-        const domain = job.companyUrl?.replace(/https?:\/\//, "").split("/")[0] || null;
-        const empCount = parseInt(job.companySize?.split("-")?.[0]) || null;
+        // curious_coder actor field names
+        const companyName = job.companyName || job.company || job.hiringOrganization?.name || "Unknown";
+        const jobTitle    = job.title || job.jobTitle || job.position || "Unknown";
+        const jobUrl      = job.jobUrl || job.url || job.applyUrl || null;
+        const postedAt    = job.postedAt || job.datePosted || job.publishedAt || null;
+        const industry    = job.companyIndustry || job.industry || "Unknown";
+        const rawSize     = job.companySize || job.employeeCount || "";
+        const empCount    = parseInt(String(rawSize).replace(/[^0-9]/g, "")) || null;
+        const domain      = job.companyUrl
+          ? job.companyUrl.replace(/https?:\/\/(www\.)?/, "").split("/")[0]
+          : job.companyWebsite?.replace(/https?:\/\/(www\.)?/, "").split("/")[0] || null;
 
         // Filter by company size
         if (empCount && empCount > maxEmployees) continue;
@@ -335,7 +356,7 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize) {
            VALUES ($1,$2,$3,$4)
            ON CONFLICT DO NOTHING
            RETURNING id`,
-          [companyName, domain, job.companyIndustry || "Unknown", empCount]
+          [companyName, domain, industry, empCount]
         );
 
         let companyId = compRows[0]?.id;
@@ -349,7 +370,7 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize) {
         const { rows: jobRows } = await pool.query(
           `INSERT INTO jobs (company_id, job_title, job_url, posted_at)
            VALUES ($1,$2,$3,$4) RETURNING id`,
-          [companyId, job.title || job.jobTitle, job.jobUrl || job.applyUrl, job.postedAt ? new Date(job.postedAt) : null]
+          [companyId, jobTitle, jobUrl, postedAt ? new Date(postedAt) : null]
         );
         const jobId = jobRows[0]?.id;
         if (!jobId) continue;
@@ -358,10 +379,10 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize) {
 
         // Score the lead
         let score = 0;
-        const daysAgo = job.postedAt ? (Date.now() - new Date(job.postedAt)) / 864e5 : 30;
+        const daysAgo = postedAt ? (Date.now() - new Date(postedAt)) / 864e5 : 30;
         if (daysAgo <= 7)  score += 2;
         else if (daysAgo <= 14) score += 1;
-        const ind = (job.companyIndustry || "").toLowerCase();
+        const ind = industry.toLowerCase();
         if (ind.includes("software") || ind.includes("saas") || ind.includes("ai") || ind.includes("tech")) score += 1;
         if (empCount && empCount <= 9) score += 1;
 
