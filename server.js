@@ -234,32 +234,25 @@ app.post("/api/scrape/run", async (req, res) => {
     // Build search keywords from roles
     const keywords = (roles || ["Software Engineer"]).join(" OR ");
 
-    // Build LinkedIn search URLs from parameters
+    // Build one LinkedIn search URL per role and combine into startUrls
     const linkedinUrls = (roles || ["Software Engineer"]).map(role => {
-      const params = new URLSearchParams({
-        keywords: role,
-        location: country || "United States",
-        f_TPR,
-        f_TP: "1",       // Full-time
-        position: "1",
-        pageNum: "0",
-      });
-      return `https://www.linkedin.com/jobs/search/?${params.toString()}`;
+      const encoded = encodeURIComponent(role);
+      const loc = encodeURIComponent(country || "United States");
+      return `https://www.linkedin.com/jobs/search/?keywords=${encoded}&location=${loc}&f_TPR=${f_TPR}&position=1&pageNum=0`;
     });
 
     console.log("LinkedIn URLs:", linkedinUrls);
 
-    // Call Apify LinkedIn Jobs Scraper
+    // Call Apify — send as plain string array (actor expects this format)
     const apifyRes = await fetch(
       `https://api.apify.com/v2/acts/curious_coder~linkedin-jobs-scraper/runs?token=${key}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          urls: linkedinUrls.map(u => ({ url: u })),
+          startUrls: linkedinUrls,
           count: 50,
           scrapeCompany: true,
-          proxy: { useApifyProxy: true },
         }),
       }
     );
@@ -301,21 +294,30 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize, actor="
     // Poll until Apify run completes
     let apifyStatus = "RUNNING";
     let attempts = 0;
+    let lastStatusData = null;
     while (apifyStatus === "RUNNING" && attempts < 40) {
       await new Promise(r => setTimeout(r, 5000));
       attempts++;
       const statusRes = await fetch(
         `https://api.apify.com/v2/actor-runs/${apifyRunId}?token=${apifyKey}`
       );
-      const statusData = await statusRes.json();
-      apifyStatus = statusData.data?.status || "FAILED";
-      console.log(`Apify run ${apifyRunId} status: ${apifyStatus}`);
+      lastStatusData = await statusRes.json();
+      apifyStatus = lastStatusData.data?.status || "FAILED";
+      console.log(`Apify run ${apifyRunId} status: ${apifyStatus} (attempt ${attempts})`);
     }
 
     if (apifyStatus !== "SUCCEEDED") {
+      // Fetch run log for debugging
+      try {
+        const logRes = await fetch(`https://api.apify.com/v2/actor-runs/${apifyRunId}/log?token=${apifyKey}`);
+        const logText = await logRes.text();
+        console.error("Apify run log:", logText.slice(0, 2000));
+      } catch(e) {}
+      const errMsg = `Apify run failed (status: ${apifyStatus}). Check Apify console: https://console.apify.com/actors/runs/${apifyRunId}`;
+      console.error(errMsg);
       await pool.query(
         "UPDATE scrape_runs SET status='failed', error_msg=$1, completed_at=NOW() WHERE id=$2",
-        [`Apify run ended with status: ${apifyStatus}`, runId]
+        [errMsg, runId]
       );
       return;
     }
