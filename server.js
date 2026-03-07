@@ -514,6 +514,11 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize, actor="
         // Filter by company size
         if (empCount && empCount > maxEmployees) continue;
 
+        // Block well-known large companies that slip through without employee count
+        const blockedCompanies = ["uber","google","microsoft","amazon","apple","meta","netflix","tata","cognizant","accenture","deloitte","ibm","oracle","salesforce","booz allen","kforce","randstad","robert half","dice","jobs via dice","talentally","remotehunter","hackajob","jobot","indeed","linkedin","staffing","solutions","recruiting","staffmark","manpower","adecco"];
+        const companyLower = companyName.toLowerCase();
+        if (blockedCompanies.some(b => companyLower.includes(b))) continue;
+
         // Upsert company
         const { rows: compRows } = await pool.query(
           `INSERT INTO companies (name, domain, industry, employee_count)
