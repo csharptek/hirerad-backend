@@ -51,9 +51,14 @@ async function migrate() {
       );
       CREATE TABLE IF NOT EXISTS scrape_runs (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        status TEXT DEFAULT 'running', jobs_found INT DEFAULT 0,
-        leads_qualified INT DEFAULT 0, error_msg TEXT,
-        started_at TIMESTAMPTZ DEFAULT NOW(), completed_at TIMESTAMPTZ
+        status TEXT DEFAULT 'running',
+        jobs_found INT DEFAULT 0,
+        leads_qualified INT DEFAULT 0,
+        apify_run_id TEXT,
+        error_msg TEXT,
+        params JSONB,
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
       );
       CREATE TABLE IF NOT EXISTS email_sequences (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -84,7 +89,7 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
-// ── Apollo Proxy: Person Search ───────────────────────────────
+// ── Apollo Proxy: Person ──────────────────────────────────────
 app.post("/api/apollo/person", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"];
   if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
@@ -101,7 +106,7 @@ app.post("/api/apollo/person", async (req, res) => {
   }
 });
 
-// ── Apollo Proxy: Company Search ──────────────────────────────
+// ── Apollo Proxy: Company ─────────────────────────────────────
 app.post("/api/apollo/company", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"];
   if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
@@ -120,13 +125,13 @@ app.post("/api/apollo/company", async (req, res) => {
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
       body: JSON.stringify({
         organization_ids: [org.id],
-        person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering"],
+        person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","vp of engineering","president"],
         page: 1, per_page: 5,
       }),
     });
     const peopleData = await peopleRes.json();
     const people = peopleData.people || [];
-    if (!people.length) return res.status(404).json({ error: `No decision makers found at "${req.body.company_name}"` });
+    if (!people.length) return res.status(404).json({ error: `No decision makers found at "${req.body.company_name}". Try searching by person name instead.` });
 
     res.json({
       org: { name: org.name, domain: org.website_url, employees: org.estimated_num_employees },
@@ -146,12 +151,15 @@ app.post("/api/apollo/company", async (req, res) => {
 // ── Dashboard ─────────────────────────────────────────────────
 app.get("/api/dashboard", async (_req, res) => {
   try {
-    const leads = await pool.query("SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE score>=2) AS qualified FROM leads");
+    const leads  = await pool.query("SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE score>=2) AS qualified FROM leads");
     const emails = await pool.query("SELECT COUNT(*) AS sent FROM email_sequences WHERE status != 'draft'");
-    const replies = await pool.query("SELECT COUNT(*) AS replied FROM email_sequences WHERE replied_at IS NOT NULL");
+    const replies= await pool.query("SELECT COUNT(*) AS replied FROM email_sequences WHERE replied_at IS NOT NULL");
     res.json({
-      leads_total: +leads.rows[0].total, leads_qualified: +leads.rows[0].qualified,
-      emails_sent: +emails.rows[0].sent, open_rate: 0, replies: +replies.rows[0].replied,
+      leads_total:     +leads.rows[0].total,
+      leads_qualified: +leads.rows[0].qualified,
+      emails_sent:     +emails.rows[0].sent,
+      open_rate: 0,
+      replies:         +replies.rows[0].replied,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -180,6 +188,19 @@ app.get("/api/leads", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Clear database ────────────────────────────────────────────
+app.delete("/api/leads/clear", async (_req, res) => {
+  try {
+    await pool.query("DELETE FROM email_sequences");
+    await pool.query("DELETE FROM leads");
+    await pool.query("DELETE FROM contacts");
+    await pool.query("DELETE FROM jobs");
+    await pool.query("DELETE FROM companies");
+    await pool.query("DELETE FROM scrape_runs");
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Enrich ────────────────────────────────────────────────────
 app.post("/api/leads/:id/enrich", async (req, res) => {
   try {
@@ -189,14 +210,190 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Scrape ────────────────────────────────────────────────────
+// ── Scrape: trigger Apify actor ───────────────────────────────
 app.post("/api/scrape/run", async (req, res) => {
+  const { country, companySize, postedWithin, roles, apifyKey } = req.body;
+  const key = apifyKey || process.env.APIFY_API_TOKEN;
+
+  if (!key) {
+    // No Apify key — create a dummy run so frontend can still poll
+    const { rows } = await pool.query(
+      "INSERT INTO scrape_runs (status, error_msg) VALUES ('failed', 'No Apify API token provided') RETURNING id"
+    );
+    return res.json({ run_id: rows[0].id, status: "failed", error: "No Apify API token. Add it in Settings." });
+  }
+
   try {
-    const { rows } = await pool.query("INSERT INTO scrape_runs (status) VALUES ('running') RETURNING id");
-    res.json({ run_id: rows[0].id, status: "running" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    // Map posted within days to LinkedIn filter
+    const dateMap = { 1:"r86400", 3:"r259200", 7:"r604800", 14:"r1209600", 30:"r2592000" };
+    const f_TPR = dateMap[postedWithin] || "r2592000";
+
+    // Build search keywords from roles
+    const keywords = (roles || ["Software Engineer"]).join(" OR ");
+
+    // Call Apify LinkedIn Jobs Scraper
+    const apifyRes = await fetch(
+      `https://api.apify.com/v2/acts/curious_coder~linkedin-jobs-scraper/runs?token=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          searchKeywords: keywords,
+          location: country || "United States",
+          count: 50,
+          f_TPR,
+          f_E: "1",       // Entry/Associate (used as proxy for small companies)
+          proxy: { useApifyProxy: true },
+        }),
+      }
+    );
+
+    const apifyData = await apifyRes.json();
+    console.log("Apify response:", JSON.stringify(apifyData).slice(0,500));
+
+    if (!apifyRes.ok || apifyData.error) {
+      throw new Error(apifyData.error?.message || apifyData.message || "Apify actor failed to start");
+    }
+
+    const apifyRunId = apifyData.data?.id || apifyData.id;
+
+    // Save run to DB
+    const { rows } = await pool.query(
+      "INSERT INTO scrape_runs (status, apify_run_id, params) VALUES ('running', $1, $2) RETURNING id",
+      [apifyRunId, JSON.stringify({ country, companySize, postedWithin, roles })]
+    );
+    const runId = rows[0].id;
+
+    // Process results in background
+    processApifyRun(runId, apifyRunId, key, companySize).catch(console.error);
+
+    res.json({ run_id: runId, apify_run_id: apifyRunId, status: "running" });
+
+  } catch (err) {
+    console.error("Scrape error:", err.message);
+    const { rows } = await pool.query(
+      "INSERT INTO scrape_runs (status, error_msg) VALUES ('failed', $1) RETURNING id",
+      [err.message]
+    );
+    res.status(500).json({ run_id: rows[0].id, error: err.message });
+  }
 });
 
+// ── Background: poll Apify and save results ───────────────────
+async function processApifyRun(runId, apifyRunId, apifyKey, companySize) {
+  try {
+    // Poll until Apify run completes
+    let apifyStatus = "RUNNING";
+    let attempts = 0;
+    while (apifyStatus === "RUNNING" && attempts < 40) {
+      await new Promise(r => setTimeout(r, 5000));
+      attempts++;
+      const statusRes = await fetch(
+        `https://api.apify.com/v2/acts/curious_coder~linkedin-jobs-scraper/runs/${apifyRunId}?token=${apifyKey}`
+      );
+      const statusData = await statusRes.json();
+      apifyStatus = statusData.data?.status || "FAILED";
+      console.log(`Apify run ${apifyRunId} status: ${apifyStatus}`);
+    }
+
+    if (apifyStatus !== "SUCCEEDED") {
+      await pool.query(
+        "UPDATE scrape_runs SET status='failed', error_msg=$1, completed_at=NOW() WHERE id=$2",
+        [`Apify run ended with status: ${apifyStatus}`, runId]
+      );
+      return;
+    }
+
+    // Fetch results from Apify dataset
+    const dataRes = await fetch(
+      `https://api.apify.com/v2/acts/curious_coder~linkedin-jobs-scraper/runs/${apifyRunId}/dataset/items?token=${apifyKey}&limit=200`
+    );
+    const jobs = await dataRes.json();
+    console.log(`Got ${jobs.length} jobs from Apify`);
+
+    // Parse company size filter
+    let maxEmployees = 9;
+    if (companySize?.includes("50")) maxEmployees = 50;
+    if (companySize?.includes("200")) maxEmployees = 200;
+    if (companySize?.includes("Any")) maxEmployees = 99999;
+
+    let jobsFound = 0;
+    let leadsQualified = 0;
+
+    for (const job of jobs) {
+      try {
+        const companyName = job.companyName || job.company || "Unknown";
+        const domain = job.companyUrl?.replace(/https?:\/\//, "").split("/")[0] || null;
+        const empCount = parseInt(job.companySize?.split("-")?.[0]) || null;
+
+        // Filter by company size
+        if (empCount && empCount > maxEmployees) continue;
+
+        // Upsert company
+        const { rows: compRows } = await pool.query(
+          `INSERT INTO companies (name, domain, industry, employee_count)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT DO NOTHING
+           RETURNING id`,
+          [companyName, domain, job.companyIndustry || "Unknown", empCount]
+        );
+
+        let companyId = compRows[0]?.id;
+        if (!companyId) {
+          const existing = await pool.query("SELECT id FROM companies WHERE name=$1", [companyName]);
+          companyId = existing.rows[0]?.id;
+        }
+        if (!companyId) continue;
+
+        // Insert job
+        const { rows: jobRows } = await pool.query(
+          `INSERT INTO jobs (company_id, job_title, job_url, posted_at)
+           VALUES ($1,$2,$3,$4) RETURNING id`,
+          [companyId, job.title || job.jobTitle, job.jobUrl || job.applyUrl, job.postedAt ? new Date(job.postedAt) : null]
+        );
+        const jobId = jobRows[0]?.id;
+        if (!jobId) continue;
+
+        jobsFound++;
+
+        // Score the lead
+        let score = 0;
+        const daysAgo = job.postedAt ? (Date.now() - new Date(job.postedAt)) / 864e5 : 30;
+        if (daysAgo <= 7)  score += 2;
+        else if (daysAgo <= 14) score += 1;
+        const ind = (job.companyIndustry || "").toLowerCase();
+        if (ind.includes("software") || ind.includes("saas") || ind.includes("ai") || ind.includes("tech")) score += 1;
+        if (empCount && empCount <= 9) score += 1;
+
+        // Insert lead
+        await pool.query(
+          `INSERT INTO leads (company_id, job_id, score, status) VALUES ($1,$2,$3,$4)`,
+          [companyId, jobId, score, score >= 2 ? "queued" : "low-score"]
+        );
+
+        if (score >= 2) leadsQualified++;
+
+      } catch (itemErr) {
+        console.error("Error processing job:", itemErr.message);
+      }
+    }
+
+    await pool.query(
+      "UPDATE scrape_runs SET status='complete', jobs_found=$1, leads_qualified=$2, completed_at=NOW() WHERE id=$3",
+      [jobsFound, leadsQualified, runId]
+    );
+    console.log(`✅ Run ${runId} complete: ${jobsFound} jobs, ${leadsQualified} leads`);
+
+  } catch (err) {
+    console.error("processApifyRun error:", err.message);
+    await pool.query(
+      "UPDATE scrape_runs SET status='failed', error_msg=$1, completed_at=NOW() WHERE id=$2",
+      [err.message, runId]
+    );
+  }
+}
+
+// ── Scrape status ─────────────────────────────────────────────
 app.get("/api/scrape/status/:id", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM scrape_runs WHERE id=$1", [req.params.id]);
@@ -219,5 +416,3 @@ migrate()
     app.listen(PORT, "0.0.0.0", () => console.log(`✅ HireRadar API running on port ${PORT}`));
   })
   .catch(err => { console.error("❌ Startup failed:", err.message); process.exit(1); });
-
-// REPLACED BY UPDATED VERSION - see below
