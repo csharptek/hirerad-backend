@@ -221,45 +221,68 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
       return res.status(400).json({ error: "Apollo API key required. Add it in Settings." });
     }
 
-    // Search Apollo for decision maker at this company
-    console.log("Calling Apollo with key:", apolloKey ? apolloKey.slice(0,8)+"..." : "MISSING");
-    const apolloRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+    console.log("Enriching:", lead.company_name, "| Key:", apolloKey ? apolloKey.slice(0,8)+"..." : "MISSING");
+
+    // Step 1: Search for decision makers at this company
+    const searchRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
       body: JSON.stringify({
         q_organization_name: lead.company_name,
-        person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","president","owner"],
-        page: 1, per_page: 1,
+        person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","president","owner","director of engineering"],
+        page: 1, per_page: 3,
+        reveal_personal_emails: true,
       }),
     });
-    const apolloText = await apolloRes.text();
-    console.log("Apollo raw response:", apolloText.slice(0, 300));
-    let apolloData;
-    try { apolloData = JSON.parse(apolloText); } 
-    catch { throw new Error(`Apollo returned non-JSON: ${apolloText.slice(0,200)}`); }
-    const person = apolloData.people?.[0];
+    const searchText = await searchRes.text();
+    let searchData;
+    try { searchData = JSON.parse(searchText); }
+    catch { throw new Error(`Apollo search error: ${searchText.slice(0,200)}`); }
 
-    if (!person) {
-      // Try by domain if available
-      if (lead.domain) {
-        const domainRes = await fetch("https://api.apollo.io/v1/people/match", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-          body: JSON.stringify({ domain: lead.domain, reveal_personal_emails: true }),
-        });
-        const domainData = await domainRes.json();
-        if (!domainData.person) {
-          return res.status(404).json({ error: `No decision maker found for ${lead.company_name}` });
-        }
-        const p = domainData.person;
-        await saveContactAndUpdateLead(lead, p, req.params.id);
-        return res.json({ success: true, contact: p });
+    console.log("Apollo search found:", searchData.people?.length || 0, "people");
+    if (searchData.people?.[0]) console.log("First person sample:", JSON.stringify(searchData.people[0]).slice(0, 400));
+
+    let person = searchData.people?.[0];
+
+    // Step 2: If found, enrich to get email
+    if (person?.id) {
+      const enrichRes = await fetch("https://api.apollo.io/v1/people/match", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+        body: JSON.stringify({
+          id: person.id,
+          reveal_personal_emails: true,
+          reveal_phone_number: false,
+        }),
+      });
+      const enrichText = await enrichRes.text();
+      let enrichData;
+      try { enrichData = JSON.parse(enrichText); } catch { enrichData = {}; }
+      if (enrichData.person) {
+        person = { ...person, ...enrichData.person };
+        console.log("Enriched person fields:", JSON.stringify(enrichData.person).slice(0, 500));
       }
-      return res.status(404).json({ error: `No decision maker found for ${lead.company_name}` });
     }
 
-    await saveContactAndUpdateLead(lead, person, req.params.id);
-    res.json({ success: true, contact: person });
+    // Step 3: If still no person, try by domain
+    if (!person && lead.domain) {
+      const domainRes = await fetch("https://api.apollo.io/v1/people/match", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+        body: JSON.stringify({ domain: lead.domain, reveal_personal_emails: true }),
+      });
+      const domainText = await domainRes.text();
+      let domainData;
+      try { domainData = JSON.parse(domainText); } catch { domainData = {}; }
+      person = domainData.person;
+    }
+
+    if (!person) {
+      return res.status(404).json({ error: `No decision maker found for "${lead.company_name}" on Apollo` });
+    }
+
+    const enriched = await saveContactAndUpdateLead(lead, person, req.params.id);
+    res.json({ success: true, contact: { ...person, ...enriched } });
 
   } catch (err) {
     console.error("Enrich error:", err.message);
@@ -268,9 +291,15 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
 });
 
 async function saveContactAndUpdateLead(lead, person, leadId) {
-  const apolloId = person.id || `manual_${Date.now()}`;
+  const apolloId = person.id || `manual_${Date.now()}_${leadId}`;
   
-  // Try upsert, fall back to plain insert if conflict issues
+  // Extract name - Apollo sometimes puts full name in different fields
+  const firstName = person.first_name || person.name?.split(" ")[0] || "Unknown";
+  const lastName  = person.last_name  || person.name?.split(" ").slice(1).join(" ") || "";
+  const email     = person.email || person.personal_email || person.work_email || null;
+  const title     = person.title || person.headline || "Decision Maker";
+  const linkedin  = person.linkedin_url || person.linkedin || null;
+
   let contactId;
   try {
     const { rows: ctRows } = await pool.query(`
@@ -280,32 +309,21 @@ async function saveContactAndUpdateLead(lead, person, leadId) {
         first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
         title=EXCLUDED.title, email=EXCLUDED.email, enriched_at=NOW()
       RETURNING id
-    `, [
-      lead.company_id,
-      person.first_name || "Unknown",
-      person.last_name || "",
-      person.title || "Decision Maker",
-      person.email || null,
-      person.linkedin_url || null,
-      apolloId,
-      !!person.email,
-    ]);
+    `, [lead.company_id, firstName, lastName, title, email, linkedin, apolloId, !!email]);
     contactId = ctRows[0].id;
   } catch(e) {
-    // If conflict, just fetch existing
     const { rows } = await pool.query("SELECT id FROM contacts WHERE apollo_id=$1", [apolloId]);
-    if (rows.length) {
-      contactId = rows[0].id;
-    } else {
-      throw e;
-    }
+    if (rows.length) { contactId = rows[0].id; } else { throw e; }
   }
 
-  const score = person.email ? Math.max(lead.score || 0, 4) : (lead.score || 2);
+  const score = email ? Math.max(lead.score || 0, 4) : (lead.score || 2);
   await pool.query(
     "UPDATE leads SET contact_id=$1, score=$2, status='queued', updated_at=NOW() WHERE id=$3",
     [contactId, score, leadId]
   );
+  
+  // Return enriched person data
+  return { first_name: firstName, last_name: lastName, title, email, linkedin_url: linkedin };
 }
 
 // ── Scrape: trigger Apify actor ───────────────────────────────
