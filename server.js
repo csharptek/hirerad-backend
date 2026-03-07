@@ -127,7 +127,7 @@ app.post("/api/apollo/company", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
       body: JSON.stringify({
-        organization_ids: [org.id],
+        organization_ids: [finalOrg.id],
         person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","vp of engineering","president"],
         page: 1, per_page: 5,
       }),
@@ -231,23 +231,62 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
     });
     const orgData = await orgRes.json();
     const org = orgData.organizations?.[0];
-    console.log("Org found:", org?.name, org?.id);
+    console.log("Org lookup for:", lead.company_name, "→", org ? `found: ${org.name} (${org.id})` : `NOT FOUND. Total orgs: ${orgData.organizations?.length || 0}`);
+    
+    // If org not found by name, try fuzzy search with shorter name
+    let finalOrg = org;
+    if (!org) {
+      const shortName = lead.company_name.split(" ").slice(0,2).join(" ");
+      const retryRes = await fetch("https://api.apollo.io/v1/mixed_companies/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+        body: JSON.stringify({ q_organization_name: shortName, page: 1, per_page: 1 }),
+      });
+      const retryData = await retryRes.json();
+      finalOrg = retryData.organizations?.[0];
+      console.log("Retry with short name:", shortName, "→", finalOrg ? `found: ${finalOrg.name}` : "still not found");
+    }
 
-    // Step 2: Search people by org ID (same as working apollo/company proxy)
+    // Step 2: Search people by org ID with title filter
     let person = null;
-    if (org?.id) {
+    if (finalOrg?.id) {
       const peopleRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
         body: JSON.stringify({
-          organization_ids: [org.id],
+          organization_ids: [finalOrg.id],
           person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","vp of engineering","president","owner"],
           page: 1, per_page: 1,
         }),
       });
       const peopleData = await peopleRes.json();
       person = peopleData.people?.[0];
-      console.log("Person found:", person?.first_name, person?.last_name, "| email:", person?.email);
+      console.log("With title filter:", peopleData.people?.length || 0, "people");
+      if (peopleData.people?.[0]) console.log("RAW person:", JSON.stringify(peopleData.people[0]).slice(0, 600));
+
+      // No results with title filter — try without filter (any person at company)
+      if (!person) {
+        const anyRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+          body: JSON.stringify({ organization_ids: [finalOrg.id], page: 1, per_page: 1 }),
+        });
+        const anyData = await anyRes.json();
+        person = anyData.people?.[0];
+        console.log("Without title filter:", anyData.people?.length || 0, "people | person:", person?.first_name, person?.title, person?.email);
+      }
+    }
+
+    // Step 3: Fallback — search by company name without org ID
+    if (!person) {
+      const fallbackRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+        body: JSON.stringify({ q_organization_name: lead.company_name, page: 1, per_page: 1 }),
+      });
+      const fallbackData = await fallbackRes.json();
+      person = fallbackData.people?.[0];
+      console.log("Name-only fallback:", fallbackData.people?.length || 0, "| person:", person?.first_name, person?.email);
     }
 
     if (!person) {
