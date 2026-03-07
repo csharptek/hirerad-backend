@@ -206,12 +206,90 @@ app.delete("/api/leads/clear", async (_req, res) => {
 
 // ── Enrich ────────────────────────────────────────────────────
 app.post("/api/leads/:id/enrich", async (req, res) => {
+  const apolloKey = req.headers["x-apollo-key"] || req.body?.apolloKey;
   try {
-    const { rows } = await pool.query("SELECT * FROM leads WHERE id=$1", [req.params.id]);
+    // Get lead + company info
+    const { rows } = await pool.query(`
+      SELECT l.*, c.name AS company_name, c.domain
+      FROM leads l JOIN companies c ON l.company_id = c.id
+      WHERE l.id = $1
+    `, [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: "Lead not found" });
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const lead = rows[0];
+
+    if (!apolloKey) {
+      return res.status(400).json({ error: "Apollo API key required. Add it in Settings." });
+    }
+
+    // Search Apollo for decision maker at this company
+    const apolloRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+      body: JSON.stringify({
+        q_organization_name: lead.company_name,
+        person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","president","owner"],
+        page: 1, per_page: 1,
+      }),
+    });
+    const apolloData = await apolloRes.json();
+    const person = apolloData.people?.[0];
+
+    if (!person) {
+      // Try by domain if available
+      if (lead.domain) {
+        const domainRes = await fetch("https://api.apollo.io/v1/people/match", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+          body: JSON.stringify({ domain: lead.domain, reveal_personal_emails: true }),
+        });
+        const domainData = await domainRes.json();
+        if (!domainData.person) {
+          return res.status(404).json({ error: `No decision maker found for ${lead.company_name}` });
+        }
+        const p = domainData.person;
+        await saveContactAndUpdateLead(lead, p, req.params.id);
+        return res.json({ success: true, contact: p });
+      }
+      return res.status(404).json({ error: `No decision maker found for ${lead.company_name}` });
+    }
+
+    await saveContactAndUpdateLead(lead, person, req.params.id);
+    res.json({ success: true, contact: person });
+
+  } catch (err) {
+    console.error("Enrich error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
+
+async function saveContactAndUpdateLead(lead, person, leadId) {
+  // Upsert contact
+  const { rows: ctRows } = await pool.query(`
+    INSERT INTO contacts (company_id, first_name, last_name, title, email, linkedin_url, apollo_id, email_verified, enriched_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+    ON CONFLICT (apollo_id) DO UPDATE SET
+      email=EXCLUDED.email, enriched_at=NOW()
+    RETURNING id
+  `, [
+    lead.company_id,
+    person.first_name, person.last_name,
+    person.title || "Decision Maker",
+    person.email || null,
+    person.linkedin_url || null,
+    person.id,
+    !!person.email,
+  ]);
+  const contactId = ctRows[0].id;
+
+  // Calculate new score
+  let score = lead.score || 0;
+  if (person.email) score = Math.max(score, 4); // boost score when email found
+
+  // Update lead
+  await pool.query(`
+    UPDATE leads SET contact_id=$1, score=$2, status='queued', updated_at=NOW() WHERE id=$3
+  `, [contactId, score, leadId]);
+}
 
 // ── Scrape: trigger Apify actor ───────────────────────────────
 app.post("/api/scrape/run", async (req, res) => {
@@ -304,7 +382,14 @@ async function processApifyRun(runId, apifyRunId, apifyKey, companySize, actor="
       );
       lastStatusData = await statusRes.json();
       apifyStatus = lastStatusData.data?.status || "FAILED";
-      console.log(`Apify run ${apifyRunId} status: ${apifyStatus} (attempt ${attempts})`);
+      const stats = lastStatusData.data?.stats || {};
+      const itemsScraped = stats.itemCount || 0;
+      console.log(`Apify run status: ${apifyStatus} · items: ${itemsScraped} (attempt ${attempts})`);
+      // Update DB with live count so frontend can show progress
+      await pool.query(
+        "UPDATE scrape_runs SET jobs_found=$1 WHERE id=$2",
+        [itemsScraped, runId]
+      );
     }
 
     if (apifyStatus !== "SUCCEEDED") {
