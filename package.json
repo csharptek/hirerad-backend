@@ -1,0 +1,23 @@
+{
+  "name": "hirerad-backend",
+  "version": "1.0.0",
+  "description": "HireRadar API — Startup Hiring Intelligence & Outbound Engine",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "db:migrate": "psql $DATABASE_URL -f schema.sql",
+    "db:seed": "node scripts/seed.js"
+  },
+  "dependencies": {
+    "apify-client": "^2.9.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
