@@ -116,61 +116,67 @@ app.post("/api/apollo/company", async (req, res) => {
   try {
     const companyName = req.body.company_name;
 
-    // Step 1: Get domain via org search
-    const orgRes = await fetch("https://api.apollo.io/v1/mixed_companies/search", {
+    // Step 1: Search people by company name + title filters
+    // Per Apollo docs: filters go as URL query params, not body
+    const params = new URLSearchParams();
+    ["ceo","founder","co-founder","cto","president","owner","head of engineering","vp of engineering"].forEach(t => params.append("person_titles[]", t));
+    params.append("q_organization_name", companyName);
+    params.append("per_page", "5");
+
+    const searchRes = await fetch(`https://api.apollo.io/api/v1/mixed_people/api_search?${params.toString()}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-      body: JSON.stringify({ q_organization_name: companyName, page: 1, per_page: 1 }),
     });
-    const orgData = await orgRes.json();
-    const org = orgData.organizations?.[0];
-    const domain = org?.primary_domain || org?.website_url?.replace(/https?:\/\/(www\.)?/,"").split("/")[0];
-    console.log("apollo/company:", companyName, "→ org:", org?.name, "domain:", domain);
+    const searchData = await searchRes.json();
+    console.log("api_search:", companyName, "→", searchData.people?.length || 0, "results | status:", searchRes.status);
+    if (searchData.error) console.log("api_search error:", searchData.error);
 
-    // Step 2: people/match by domain + title (most reliable for emails)
-    const titles = ["ceo","founder","co-founder","cto","president","owner","head of engineering","vp of engineering"];
-    let person = null;
+    let people = searchData.people || [];
 
-    if (domain) {
-      for (const title of titles) {
-        const r = await fetch("https://api.apollo.io/v1/people/match", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-          body: JSON.stringify({ domain, title, reveal_personal_emails: true }),
-        });
-        const d = await r.json();
-        console.log("people/match title:", title, "→", d.person?.first_name || "none", d.person?.email || "no email");
-        if (d.person?.first_name) { person = d.person; break; }
-      }
-    }
-
-    // Step 3: fallback — people/match by org name only
-    if (!person) {
-      const r = await fetch("https://api.apollo.io/v1/people/match", {
+    // Fallback: no title filter
+    if (!people.length) {
+      const p2 = new URLSearchParams();
+      p2.append("q_organization_name", companyName);
+      p2.append("per_page", "3");
+      const r2 = await fetch(`https://api.apollo.io/api/v1/mixed_people/api_search?${p2.toString()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-        body: JSON.stringify({ organization_name: companyName, reveal_personal_emails: true }),
       });
-      const d = await r.json();
-      console.log("people/match org fallback →", d.person?.first_name || "none");
-      if (d.person?.first_name) person = d.person;
+      const d2 = await r2.json();
+      people = d2.people || [];
+      console.log("api_search no-title fallback:", people.length, "results");
     }
 
-    if (!person?.first_name) {
-      return res.status(404).json({ error: `No contact found for "${companyName}" on Apollo` });
+    if (!people.length) {
+      return res.status(404).json({ error: `No contacts found for "${companyName}" on Apollo` });
     }
 
-    res.json({
-      org: { name: org?.name || companyName, domain, employees: org?.estimated_num_employees },
-      people: [{
-        name: `${person.first_name} ${person.last_name || ""}`.trim(),
-        title: person.title || "—",
-        email: person.email || null,
-        linkedin: person.linkedin_url || null,
-        verified: !!person.email,
-        apollo_id: person.id,
-      }],
+    // Step 2: Bulk enrich to get emails
+    // Per Apollo docs: reveal_personal_emails goes as URL query param
+    const enrichRes = await fetch("https://api.apollo.io/api/v1/people/bulk_match?reveal_personal_emails=true&reveal_phone_number=false", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+      body: JSON.stringify({ details: people.map(p => ({ id: p.id })) }),
     });
+    const enrichData = await enrichRes.json();
+    console.log("bulk_match status:", enrichRes.status, "| matches:", enrichData.matches?.length || 0);
+
+    const enrichedMap = {};
+    (enrichData.matches || []).forEach(m => { if (m.id) enrichedMap[m.id] = m; });
+
+    const result = people.map(p => {
+      const e = enrichedMap[p.id] || {};
+      return {
+        name: `${e.first_name || p.first_name || ""} ${e.last_name || ""}`.trim() || "Unknown",
+        title: e.title || p.title || "—",
+        email: e.email || null,
+        linkedin: e.linkedin_url || null,
+        verified: !!(e.email),
+        apollo_id: p.id,
+      };
+    });
+
+    res.json({ org: { name: companyName }, people: result });
   } catch (err) {
     console.error("apollo/company error:", err.message);
     res.status(500).json({ error: err.message });
