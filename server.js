@@ -221,60 +221,33 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
       return res.status(400).json({ error: "Apollo API key required. Add it in Settings." });
     }
 
-    console.log("Enriching:", lead.company_name, "| Key:", apolloKey ? apolloKey.slice(0,8)+"..." : "MISSING");
+    console.log("Enriching:", lead.company_name);
 
-    // Step 1: Search for decision makers at this company
-    const searchRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+    // Step 1: Find company by name to get org ID (same as working apollo/company proxy)
+    const orgRes = await fetch("https://api.apollo.io/v1/mixed_companies/search", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-      body: JSON.stringify({
-        q_organization_name: lead.company_name,
-        person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","president","owner","director of engineering"],
-        page: 1, per_page: 3,
-        reveal_personal_emails: true,
-      }),
+      body: JSON.stringify({ q_organization_name: lead.company_name, page: 1, per_page: 1 }),
     });
-    const searchText = await searchRes.text();
-    let searchData;
-    try { searchData = JSON.parse(searchText); }
-    catch { throw new Error(`Apollo search error: ${searchText.slice(0,200)}`); }
+    const orgData = await orgRes.json();
+    const org = orgData.organizations?.[0];
+    console.log("Org found:", org?.name, org?.id);
 
-    console.log("Apollo search found:", searchData.people?.length || 0, "people");
-    if (searchData.people?.[0]) console.log("First person sample:", JSON.stringify(searchData.people[0]).slice(0, 400));
-
-    let person = searchData.people?.[0];
-
-    // Step 2: If found, enrich to get email
-    if (person?.id) {
-      const enrichRes = await fetch("https://api.apollo.io/v1/people/match", {
+    // Step 2: Search people by org ID (same as working apollo/company proxy)
+    let person = null;
+    if (org?.id) {
+      const peopleRes = await fetch("https://api.apollo.io/v1/mixed_people/search", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
         body: JSON.stringify({
-          id: person.id,
-          reveal_personal_emails: true,
-          reveal_phone_number: false,
+          organization_ids: [org.id],
+          person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","vp of engineering","president","owner"],
+          page: 1, per_page: 1,
         }),
       });
-      const enrichText = await enrichRes.text();
-      let enrichData;
-      try { enrichData = JSON.parse(enrichText); } catch { enrichData = {}; }
-      if (enrichData.person) {
-        person = { ...person, ...enrichData.person };
-        console.log("Enriched person fields:", JSON.stringify(enrichData.person).slice(0, 500));
-      }
-    }
-
-    // Step 3: If still no person, try by domain
-    if (!person && lead.domain) {
-      const domainRes = await fetch("https://api.apollo.io/v1/people/match", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-        body: JSON.stringify({ domain: lead.domain, reveal_personal_emails: true }),
-      });
-      const domainText = await domainRes.text();
-      let domainData;
-      try { domainData = JSON.parse(domainText); } catch { domainData = {}; }
-      person = domainData.person;
+      const peopleData = await peopleRes.json();
+      person = peopleData.people?.[0];
+      console.log("Person found:", person?.first_name, person?.last_name, "| email:", person?.email);
     }
 
     if (!person) {
