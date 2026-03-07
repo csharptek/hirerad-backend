@@ -253,7 +253,7 @@ app.post("/api/scrape/run", async (req, res) => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          startUrls: linkedinUrls,
+          urls: linkedinUrls.map(u => ({ url: u })),
           count: 50,
           scrapeCompany: true,
           proxy: { useApifyProxy: true },
