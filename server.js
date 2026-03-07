@@ -250,9 +250,10 @@ app.post("/api/scrape/run", async (req, res) => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          startUrls: linkedinUrls,
-          count: 50,
+          urls: linkedinUrls,
+          count: 100,
           scrapeCompany: true,
+          splitByLocation: false,
         }),
       }
     );
