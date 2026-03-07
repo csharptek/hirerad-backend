@@ -9,110 +9,123 @@ const app  = express();
 const PORT = process.env.PORT || 4000;
 
 // ── DB Pool ──────────────────────────────────────────────────
-export const pool = new pg.Pool({
+const { Pool } = pg;
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
+
+pool.on("error", (err) => console.error("PG pool error:", err.message));
 
 // ── Auto-migrate ─────────────────────────────────────────────
 async function migrate() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS companies (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      name TEXT NOT NULL,
-      domain TEXT,
-      industry TEXT,
-      employee_count INT,
-      linkedin_url TEXT,
-      apollo_id TEXT UNIQUE,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS jobs (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID REFERENCES companies(id),
-      job_title TEXT,
-      job_url TEXT,
-      location TEXT,
-      posted_at TIMESTAMPTZ,
-      raw_data JSONB,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS contacts (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID REFERENCES companies(id),
-      first_name TEXT,
-      last_name TEXT,
-      title TEXT,
-      email TEXT,
-      linkedin_url TEXT,
-      apollo_id TEXT UNIQUE,
-      email_verified BOOLEAN DEFAULT false,
-      enriched_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS leads (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      company_id UUID REFERENCES companies(id),
-      job_id UUID REFERENCES jobs(id),
-      contact_id UUID REFERENCES contacts(id),
-      score INT DEFAULT 0,
-      status TEXT DEFAULT 'pending',
-      campaign_id TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS scrape_runs (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      status TEXT DEFAULT 'running',
-      jobs_found INT DEFAULT 0,
-      leads_qualified INT DEFAULT 0,
-      error_msg TEXT,
-      started_at TIMESTAMPTZ DEFAULT NOW(),
-      completed_at TIMESTAMPTZ
-    );
-    CREATE TABLE IF NOT EXISTS email_sequences (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      lead_id UUID REFERENCES leads(id),
-      step INT DEFAULT 1,
-      status TEXT DEFAULT 'draft',
-      subject TEXT,
-      body TEXT,
-      sent_at TIMESTAMPTZ,
-      opened_at TIMESTAMPTZ,
-      replied_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  console.log("✅ Database tables ready");
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS companies (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL,
+        domain TEXT,
+        industry TEXT,
+        employee_count INT,
+        apollo_id TEXT UNIQUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS jobs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
+        job_title TEXT,
+        job_url TEXT,
+        posted_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS contacts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
+        first_name TEXT,
+        last_name TEXT,
+        title TEXT,
+        email TEXT,
+        linkedin_url TEXT,
+        apollo_id TEXT UNIQUE,
+        email_verified BOOLEAN DEFAULT false,
+        enriched_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS leads (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
+        job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
+        contact_id UUID REFERENCES contacts(id) ON DELETE SET NULL,
+        score INT DEFAULT 0,
+        status TEXT DEFAULT 'pending',
+        campaign_id TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS scrape_runs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        status TEXT DEFAULT 'running',
+        jobs_found INT DEFAULT 0,
+        leads_qualified INT DEFAULT 0,
+        error_msg TEXT,
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+      );
+      CREATE TABLE IF NOT EXISTS email_sequences (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        lead_id UUID REFERENCES leads(id) ON DELETE CASCADE,
+        step INT DEFAULT 1,
+        status TEXT DEFAULT 'draft',
+        subject TEXT,
+        body TEXT,
+        sent_at TIMESTAMPTZ,
+        opened_at TIMESTAMPTZ,
+        replied_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    console.log("✅ Database tables ready");
+  } finally {
+    client.release();
+  }
 }
 
 // ── Middleware ───────────────────────────────────────────────
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use((req, _res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+  console.log(`${req.method} ${req.path}`);
   next();
 });
 
 // ── Health ───────────────────────────────────────────────────
 app.get("/api/health", async (_req, res) => {
-  const dbOk = await pool.query("SELECT 1").then(() => true).catch(() => false);
-  res.json({ status: "ok", db: dbOk, timestamp: new Date().toISOString() });
+  try {
+    await pool.query("SELECT 1");
+    res.json({ status: "ok", db: true, timestamp: new Date().toISOString() });
+  } catch (err) {
+    res.json({ status: "ok", db: false, error: err.message });
+  }
 });
 
 // ── Dashboard ────────────────────────────────────────────────
 app.get("/api/dashboard", async (_req, res) => {
   try {
-    const [leads, emails, replies] = await Promise.all([
-      pool.query("SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE score>=2) AS qualified FROM leads"),
-      pool.query("SELECT COUNT(*) AS sent, COUNT(*) FILTER (WHERE status='opened') AS opened FROM email_sequences WHERE status != 'draft'"),
-      pool.query("SELECT COUNT(*) AS replied FROM email_sequences WHERE replied_at IS NOT NULL"),
-    ]);
+    const leads = await pool.query(
+      "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE score>=2) AS qualified FROM leads"
+    );
+    const emails = await pool.query(
+      "SELECT COUNT(*) AS sent FROM email_sequences WHERE status != 'draft'"
+    );
+    const replies = await pool.query(
+      "SELECT COUNT(*) AS replied FROM email_sequences WHERE replied_at IS NOT NULL"
+    );
     res.json({
       leads_total:     +leads.rows[0].total,
       leads_qualified: +leads.rows[0].qualified,
       emails_sent:     +emails.rows[0].sent,
-      open_rate:       emails.rows[0].sent > 0 ? +(emails.rows[0].opened / emails.rows[0].sent * 100).toFixed(1) : 0,
+      open_rate:       0,
       replies:         +replies.rows[0].replied,
     });
   } catch (err) {
@@ -125,7 +138,7 @@ app.get("/api/leads", async (req, res) => {
   const { status, min_score = 0, limit = 50, offset = 0 } = req.query;
   try {
     let q = `
-      SELECT l.*, j.job_title, j.job_url, j.posted_at,
+      SELECT l.*, j.job_title, j.posted_at,
              c.name AS company_name, c.domain, c.industry, c.employee_count,
              ct.first_name, ct.last_name, ct.title AS contact_title,
              ct.email AS contact_email, ct.linkedin_url, ct.email_verified
@@ -146,15 +159,12 @@ app.get("/api/leads", async (req, res) => {
   }
 });
 
-// ── Enrich lead ───────────────────────────────────────────────
+// ── Enrich ───────────────────────────────────────────────────
 app.post("/api/leads/:id/enrich", async (req, res) => {
-  const { id } = req.params;
   try {
-    const { rows } = await pool.query(
-      `SELECT l.*, c.domain, c.name AS company_name FROM leads l JOIN companies c ON l.company_id = c.id WHERE l.id = $1`, [id]
-    );
+    const { rows } = await pool.query("SELECT * FROM leads WHERE id=$1", [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: "Lead not found" });
-    res.json({ success: true, message: "Enrichment triggered" });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -163,7 +173,9 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
 // ── Scrape ────────────────────────────────────────────────────
 app.post("/api/scrape/run", async (req, res) => {
   try {
-    const { rows } = await pool.query(`INSERT INTO scrape_runs (status) VALUES ('running') RETURNING id`);
+    const { rows } = await pool.query(
+      "INSERT INTO scrape_runs (status) VALUES ('running') RETURNING id"
+    );
     res.json({ run_id: rows[0].id, status: "running" });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -173,7 +185,7 @@ app.post("/api/scrape/run", async (req, res) => {
 app.get("/api/scrape/status/:id", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM scrape_runs WHERE id=$1", [req.params.id]);
-    if (!rows.length) return res.status(404).json({ error: "Run not found" });
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -192,7 +204,9 @@ app.post("/api/campaign/launch", async (req, res) => {
 // ── Start ─────────────────────────────────────────────────────
 migrate()
   .then(() => {
-    app.listen(PORT, () => console.log(`✅ HireRadar API running on :${PORT}`));
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`✅ HireRadar API running on port ${PORT}`);
+    });
   })
   .catch(err => {
     console.error("❌ Startup failed:", err.message);
