@@ -263,32 +263,44 @@ app.post("/api/leads/:id/enrich", async (req, res) => {
 });
 
 async function saveContactAndUpdateLead(lead, person, leadId) {
-  // Upsert contact
-  const { rows: ctRows } = await pool.query(`
-    INSERT INTO contacts (company_id, first_name, last_name, title, email, linkedin_url, apollo_id, email_verified, enriched_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-    ON CONFLICT (apollo_id) DO UPDATE SET
-      email=EXCLUDED.email, enriched_at=NOW()
-    RETURNING id
-  `, [
-    lead.company_id,
-    person.first_name, person.last_name,
-    person.title || "Decision Maker",
-    person.email || null,
-    person.linkedin_url || null,
-    person.id,
-    !!person.email,
-  ]);
-  const contactId = ctRows[0].id;
+  const apolloId = person.id || `manual_${Date.now()}`;
+  
+  // Try upsert, fall back to plain insert if conflict issues
+  let contactId;
+  try {
+    const { rows: ctRows } = await pool.query(`
+      INSERT INTO contacts (company_id, first_name, last_name, title, email, linkedin_url, apollo_id, email_verified, enriched_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+      ON CONFLICT (apollo_id) DO UPDATE SET
+        first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
+        title=EXCLUDED.title, email=EXCLUDED.email, enriched_at=NOW()
+      RETURNING id
+    `, [
+      lead.company_id,
+      person.first_name || "Unknown",
+      person.last_name || "",
+      person.title || "Decision Maker",
+      person.email || null,
+      person.linkedin_url || null,
+      apolloId,
+      !!person.email,
+    ]);
+    contactId = ctRows[0].id;
+  } catch(e) {
+    // If conflict, just fetch existing
+    const { rows } = await pool.query("SELECT id FROM contacts WHERE apollo_id=$1", [apolloId]);
+    if (rows.length) {
+      contactId = rows[0].id;
+    } else {
+      throw e;
+    }
+  }
 
-  // Calculate new score
-  let score = lead.score || 0;
-  if (person.email) score = Math.max(score, 4); // boost score when email found
-
-  // Update lead
-  await pool.query(`
-    UPDATE leads SET contact_id=$1, score=$2, status='queued', updated_at=NOW() WHERE id=$3
-  `, [contactId, score, leadId]);
+  const score = person.email ? Math.max(lead.score || 0, 4) : (lead.score || 2);
+  await pool.query(
+    "UPDATE leads SET contact_id=$1, score=$2, status='queued', updated_at=NOW() WHERE id=$3",
+    [contactId, score, leadId]
+  );
 }
 
 // ── Scrape: trigger Apify actor ───────────────────────────────
