@@ -127,8 +127,7 @@ app.post("/api/apollo/company", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
       body: JSON.stringify({
-        organization_ids: [finalOrg.id],
-        person_titles: ["founder","co-founder","ceo","cto","chief executive","chief technology","head of engineering","vp engineering","vp of engineering","president"],
+        organization_ids: [org.id],
         page: 1, per_page: 5,
       }),
     });
@@ -207,6 +206,33 @@ app.delete("/api/leads/clear", async (_req, res) => {
 // ── Enrich ────────────────────────────────────────────────────
 app.post("/api/leads/:id/enrich", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"] || req.body?.apolloKey;
+
+  // If contact already found by frontend, just save it
+  if (req.body?.contact) {
+    try {
+      const { rows } = await pool.query(`
+        SELECT l.*, c.name AS company_name, c.domain, l.company_id
+        FROM leads l JOIN companies c ON l.company_id = c.id
+        WHERE l.id = $1
+      `, [req.params.id]);
+      if (!rows.length) return res.status(404).json({ error: "Lead not found" });
+      const lead = rows[0];
+      const p = req.body.contact;
+      const mapped = {
+        id: p.apollo_id || `fe_${Date.now()}`,
+        first_name: p.name?.split(" ")[0] || p.first_name || "Unknown",
+        last_name: p.name?.split(" ").slice(1).join(" ") || p.last_name || "",
+        title: p.title,
+        email: p.email,
+        linkedin_url: p.linkedin || p.linkedin_url,
+      };
+      const enriched = await saveContactAndUpdateLead(lead, mapped, req.params.id);
+      return res.json({ success: true, contact: enriched });
+    } catch(err) {
+      console.error("Save contact error:", err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
   try {
     // Get lead + company info
     const { rows } = await pool.query(`
