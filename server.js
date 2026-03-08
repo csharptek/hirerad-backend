@@ -261,6 +261,28 @@ app.get("/api/leads", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Bulk delete leads ─────────────────────────────────────────
+app.delete("/api/leads/bulk-delete", async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!ids || !Array.isArray(ids) || !ids.length) {
+      return res.status(400).json({ error: "ids array required" });
+    }
+    const placeholders = ids.map((_, i) => `$${i + 1}`).join(",");
+    await pool.query(`DELETE FROM leads WHERE id IN (${placeholders})`, ids);
+    res.json({ success: true, deleted: ids.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Delete single lead ─────────────────────────────────────────
+app.delete("/api/leads/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM leads WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── Clear database ────────────────────────────────────────────
 app.delete("/api/leads/clear", async (_req, res) => {
   try {
