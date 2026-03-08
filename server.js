@@ -184,6 +184,43 @@ app.post("/api/apollo/company", async (req, res) => {
 });
 
 
+// ── AI Email Generator ───────────────────────────────────────────────────────
+app.post("/api/generate-email", async (req, res) => {
+  const { systemPrompt, userPrompt } = req.body;
+  if (!systemPrompt || !userPrompt) return res.status(400).json({ error: "Missing prompts" });
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY || "",
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        system: systemPrompt,
+        messages: [{ role: "user", content: userPrompt }],
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      console.error("Anthropic API error:", JSON.stringify(data));
+      return res.status(500).json({ error: data.error?.message || "AI generation failed" });
+    }
+    const text = data.content?.find(b => b.type === "text")?.text || "{}";
+    try {
+      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      res.json(parsed);
+    } catch {
+      res.json({ subject: "Quick question about your hiring", body: text });
+    }
+  } catch (err) {
+    console.error("generate-email error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Dashboard ─────────────────────────────────────────────────
 app.get("/api/dashboard", async (_req, res) => {
   try {
