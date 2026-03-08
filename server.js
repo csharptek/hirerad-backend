@@ -202,7 +202,7 @@ app.get("/api/dashboard", async (_req, res) => {
 
 // ── Leads ─────────────────────────────────────────────────────
 app.get("/api/leads", async (req, res) => {
-  const { status, min_score = 0, limit = 50, offset = 0 } = req.query;
+  const { status, min_score = 0, limit = 500, offset = 0 } = req.query;
   try {
     let q = `
       SELECT l.*, j.job_title, j.posted_at,
