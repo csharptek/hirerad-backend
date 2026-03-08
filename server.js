@@ -205,7 +205,7 @@ app.get("/api/leads", async (req, res) => {
   const { status, min_score = 0, limit = 500, offset = 0 } = req.query;
   try {
     let q = `
-      SELECT l.*, j.job_title, j.posted_at,
+      SELECT l.*, j.job_title, j.job_url, j.posted_at,
              c.name AS company_name, c.domain, c.industry, c.employee_count,
              ct.first_name, ct.last_name, ct.title AS contact_title,
              ct.email AS contact_email, ct.linkedin_url, ct.email_verified
