@@ -69,6 +69,14 @@ async function migrate() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    // Settings table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
     // Add columns if they don't exist (safe migration)
     await client.query(`ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS apify_run_id TEXT`);
     await client.query(`ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS params JSONB`);
@@ -89,6 +97,44 @@ app.get("/api/health", async (_req, res) => {
     res.json({ status: "ok", db: true, timestamp: new Date().toISOString() });
   } catch (err) {
     res.json({ status: "ok", db: false, error: err.message });
+  }
+});
+
+// ── Settings ─────────────────────────────────────────────────
+// Keys we persist (never store values in server logs)
+const SETTINGS_KEYS = [
+  "apolloKey", "apifyKey", "instantlyKey", "githubToken",
+  "azureOpenAiEndpoint", "azureOpenAiKey", "azureOpenAiDeployment", "azureOpenAiApiVersion",
+];
+
+app.get("/api/settings", async (_req, res) => {
+  try {
+    const result = await pool.query("SELECT key, value FROM settings WHERE key = ANY($1)", [SETTINGS_KEYS]);
+    const obj = {};
+    result.rows.forEach(r => { obj[r.key] = r.value; });
+    res.json(obj);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/settings", async (req, res) => {
+  const updates = req.body; // { apolloKey: "...", apifyKey: "...", ... }
+  if (!updates || typeof updates !== "object") return res.status(400).json({ error: "Expected JSON object" });
+
+  try {
+    // Upsert each key individually
+    for (const [key, value] of Object.entries(updates)) {
+      if (!SETTINGS_KEYS.includes(key)) continue; // ignore unknown keys
+      await pool.query(
+        `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+        [key, value ?? ""]
+      );
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -691,6 +737,79 @@ app.post("/api/campaign/launch", async (req, res) => {
   if (!Array.isArray(lead_ids) || !lead_ids.length)
     return res.status(400).json({ error: "lead_ids array required" });
   res.json({ results: lead_ids.map(id => ({ leadId: id, status: "launched" })) });
+});
+
+// ── GitHub Deploy ─────────────────────────────────────────────
+app.post("/api/deploy", async (req, res) => {
+  const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
+  const DEPLOY_SECRET = process.env.DEPLOY_SECRET;
+  const GITHUB_OWNER  = process.env.GITHUB_OWNER || "csharptek";
+
+  // Auth check
+  const secret = req.headers["x-deploy-secret"];
+  if (DEPLOY_SECRET && secret !== DEPLOY_SECRET)
+    return res.status(401).json({ error: "Invalid deploy secret" });
+
+  if (!GITHUB_TOKEN)
+    return res.status(500).json({ error: "GITHUB_TOKEN not set on server" });
+
+  const { files } = req.body;
+  if (!Array.isArray(files) || !files.length)
+    return res.status(400).json({ error: "files array required" });
+
+  const results = [];
+
+  for (const file of files) {
+    const { repo, path, branch = "main", content } = file;
+    if (!repo || !path || !content) {
+      results.push({ path, status: "error", error: "Missing repo/path/content" });
+      continue;
+    }
+
+    const apiBase = `https://api.github.com/repos/${GITHUB_OWNER}/${repo}/contents/${path}`;
+    const headers = {
+      "Authorization": `token ${GITHUB_TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      "Content-Type": "application/json",
+      "User-Agent": "HireRadar-Deploy",
+    };
+
+    try {
+      // Get current SHA (needed for update)
+      let sha = null;
+      const getResp = await fetch(`${apiBase}?ref=${branch}`, { headers });
+      if (getResp.ok) {
+        const existing = await getResp.json();
+        sha = existing.sha;
+      }
+
+      // Commit the file
+      const body = {
+        message: `deploy: update ${path} [${new Date().toISOString()}]`,
+        content: Buffer.from(content).toString("base64"),
+        branch,
+        ...(sha ? { sha } : {}),
+      };
+
+      const putResp = await fetch(apiBase, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify(body),
+      });
+
+      const putData = await putResp.json();
+      if (!putResp.ok) throw new Error(putData.message || putResp.status);
+
+      results.push({ path, repo, status: "success", commit: putData.commit?.sha?.slice(0, 7) });
+      console.log(`✅ Deployed ${repo}/${path} → ${putData.commit?.sha?.slice(0, 7)}`);
+    } catch (err) {
+      results.push({ path, repo, status: "error", error: err.message });
+      console.error(`❌ Deploy failed ${repo}/${path}: ${err.message}`);
+    }
+  }
+
+  const allOk = results.every(r => r.status === "success");
+  res.json({ success: allOk, results });
 });
 
 // ── Start ─────────────────────────────────────────────────────
