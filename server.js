@@ -155,6 +155,47 @@ app.post("/api/apollo/person", async (req, res) => {
   }
 });
 
+// ── Apollo Proxy: Person Search (by name + location) ─────────
+// Uses people search API — works with just a name, unlike people/match
+app.post("/api/apollo/person-search", async (req, res) => {
+  const apolloKey = req.headers["x-apollo-key"];
+  if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
+
+  const { name, location } = req.body;
+  if (!name) return res.status(400).json({ error: "name is required" });
+
+  try {
+    const params = new URLSearchParams();
+    params.append("q_keywords", name);
+    if (location) params.append("person_locations[]", location);
+    params.append("per_page", "10");
+    params.append("page", "1");
+
+    const response = await fetch(`https://api.apollo.io/api/v1/mixed_people/api_search?${params.toString()}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+    });
+    const data = await response.json();
+
+    const people = (data.people || []).map(p => ({
+      apollo_id: p.id,
+      name:      p.name || `${p.first_name||""} ${p.last_name||""}`.trim(),
+      title:     p.title || "—",
+      company:   p.organization?.name || p.employment_history?.[0]?.organization_name || "—",
+      domain:    p.organization?.website_url || "",
+      email:     p.email || "",
+      phone:     p.phone_numbers?.[0]?.sanitized_number || "",
+      linkedin:  p.linkedin_url || "",
+      verified:  !!p.email,
+      location:  [p.city, p.state, p.country].filter(Boolean).join(", "),
+    }));
+
+    res.json({ people, total: data.pagination?.total_entries || people.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Apollo Proxy: Company People (ALL people at company) ─────
 app.post("/api/apollo/company-people", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"];
