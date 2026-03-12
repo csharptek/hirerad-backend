@@ -155,7 +155,58 @@ app.post("/api/apollo/person", async (req, res) => {
   }
 });
 
-// ── Apollo Proxy: Company ─────────────────────────────────────
+// ── Apollo Proxy: Company People (ALL people at company) ─────
+app.post("/api/apollo/company-people", async (req, res) => {
+  const apolloKey = req.headers["x-apollo-key"];
+  if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
+  const { company_name } = req.body;
+  if (!company_name) return res.status(400).json({ error: "company_name required" });
+
+  try {
+    // Step 1: Get org info first
+    const orgRes  = await fetch("https://api.apollo.io/api/v1/organizations/enrich?" + new URLSearchParams({ domain: company_name }), {
+      headers: { "x-api-key": apolloKey, "Cache-Control": "no-cache" },
+    });
+    const orgData = await orgRes.json();
+    const org = orgData.organization || null;
+
+    // Step 2: Search ALL people at this company (no title filter)
+    const params = new URLSearchParams();
+    params.append("q_organization_name", company_name);
+    params.append("per_page", "25");
+    if (org?.id) params.append("organization_ids[]", org.id);
+
+    const peopleRes  = await fetch(`https://api.apollo.io/api/v1/mixed_people/api_search?${params.toString()}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+    });
+    const peopleData = await peopleRes.json();
+    const people = (peopleData.people || []).map(p => ({
+      apollo_id: p.id,
+      name:      p.name || `${p.first_name||""} ${p.last_name||""}`.trim(),
+      title:     p.title || "—",
+      email:     p.email || "",
+      phone:     p.phone_numbers?.[0]?.sanitized_number || "",
+      linkedin:  p.linkedin_url || "",
+      verified:  !!p.email,
+      location:  [p.city, p.state, p.country].filter(Boolean).join(", "),
+    }));
+
+    res.json({
+      org: org ? {
+        name:      org.name,
+        domain:    org.website_url || org.primary_domain,
+        employees: org.estimated_num_employees,
+        industry:  org.industry,
+      } : { name: company_name },
+      people,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Apollo Proxy: Company (Execs only — legacy) ───────────────
 app.post("/api/apollo/company", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"];
   if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
