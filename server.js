@@ -181,21 +181,46 @@ app.post("/api/apollo/person-search", async (req, res) => {
   const { q, seniorities, page = 1, per_page = 10 } = req.body;
   if (!q) return res.status(400).json({ error: "q (query) is required" });
 
-  try {
-    // Use POST body for mixed_people/api_search
-    const body = {
-      q_keywords: q,
-      page,
-      per_page,
-    };
-    if (seniorities?.length) body.person_seniorities = seniorities;
+  // Apollo q_keywords searches: name, title, company — NOT location/city
+  // Strategy: treat last word as potential location if query is 3+ words
+  // Send name keywords as q_keywords and pass city as person_locations[]
+  const words = q.trim().split(/\s+/);
+  let keywords = q.trim();
+  let locations = [];
 
+  if (words.length >= 3) {
+    // Last word might be a city/location — try it as person_locations
+    keywords = words.slice(0, -1).join(" ");
+    locations = [words[words.length - 1]];
+  }
+
+  const doSearch = async (kw, locs) => {
+    const body = { q_keywords: kw, page, per_page };
+    if (seniorities?.length) body.person_seniorities = seniorities;
+    if (locs?.length) body.person_locations = locs;
     const response = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
       body: JSON.stringify(body),
     });
-    const data = await response.json();
+    return response.json();
+  };
+
+  try {
+    let data = await doSearch(keywords, locations);
+
+    // Fallback 1: if no results with location split, try full query as keywords (no location)
+    if (!data.people?.length && locations.length) {
+      console.log(`person-search: no results with location "${locations[0]}", retrying with full query`);
+      data = await doSearch(q.trim(), []);
+    }
+
+    // Fallback 2: if still no results and query has 3+ words, try just first 2 words (first + last name)
+    if (!data.people?.length && words.length >= 3) {
+      const nameOnly = words.slice(0, 2).join(" ");
+      console.log(`person-search: no results, retrying with name only "${nameOnly}"`);
+      data = await doSearch(nameOnly, []);
+    }
 
     const people = (data.people || []).map(p => ({
       apollo_id: p.id,
@@ -203,7 +228,7 @@ app.post("/api/apollo/person-search", async (req, res) => {
       title:     p.title || "—",
       company:   p.organization?.name || p.employment_history?.[0]?.organization_name || "—",
       domain:    p.organization?.website_url || "",
-      email:     "",   // search API never returns email — must enrich separately
+      email:     "",
       phone:     "",
       linkedin:  p.linkedin_url || "",
       location:  [p.city, p.state, p.country].filter(Boolean).join(", "),
