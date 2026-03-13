@@ -77,6 +77,23 @@ async function migrate() {
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    // Saved contacts table — auto-populated when enrichment returns email/phone
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS saved_contacts (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        apollo_id  TEXT,
+        name       TEXT,
+        title      TEXT,
+        company    TEXT,
+        domain     TEXT,
+        email      TEXT,
+        phone      TEXT,
+        linkedin   TEXT,
+        location   TEXT,
+        source     TEXT DEFAULT 'person_lookup',
+        saved_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
     // Add columns if they don't exist (safe migration)
     await client.query(`ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS apify_run_id TEXT`);
     await client.query(`ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS params JSONB`);
@@ -155,25 +172,28 @@ app.post("/api/apollo/person", async (req, res) => {
   }
 });
 
-// ── Apollo Proxy: Person Search (by name + location) ─────────
-// Uses people search API — works with just a name, unlike people/match
+// ── Apollo Proxy: Person Search (free text q_keywords) ───────
+// Uses mixed_people/api_search — works with name, company, location all in one query
 app.post("/api/apollo/person-search", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"];
   if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
 
-  const { name, location } = req.body;
-  if (!name) return res.status(400).json({ error: "name is required" });
+  const { q, seniorities, page = 1, per_page = 10 } = req.body;
+  if (!q) return res.status(400).json({ error: "q (query) is required" });
 
   try {
-    const params = new URLSearchParams();
-    params.append("q_keywords", name);
-    if (location) params.append("person_locations[]", location);
-    params.append("per_page", "10");
-    params.append("page", "1");
+    // Use POST body for mixed_people/api_search
+    const body = {
+      q_keywords: q,
+      page,
+      per_page,
+    };
+    if (seniorities?.length) body.person_seniorities = seniorities;
 
-    const response = await fetch(`https://api.apollo.io/api/v1/mixed_people/api_search?${params.toString()}`, {
+    const response = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+      body: JSON.stringify(body),
     });
     const data = await response.json();
 
@@ -183,53 +203,59 @@ app.post("/api/apollo/person-search", async (req, res) => {
       title:     p.title || "—",
       company:   p.organization?.name || p.employment_history?.[0]?.organization_name || "—",
       domain:    p.organization?.website_url || "",
-      email:     p.email || "",
-      phone:     p.phone_numbers?.[0]?.sanitized_number || "",
+      email:     "",   // search API never returns email — must enrich separately
+      phone:     "",
       linkedin:  p.linkedin_url || "",
-      verified:  !!p.email,
       location:  [p.city, p.state, p.country].filter(Boolean).join(", "),
     }));
 
-    res.json({ people, total: data.pagination?.total_entries || people.length });
+    res.json({ people, total: data.pagination?.total_entries || people.length, page, per_page });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Apollo Proxy: Company People (ALL people at company) ─────
+// ── Apollo Proxy: Company People ─────────────────────────────
+// Supports seniority filters + pagination
 app.post("/api/apollo/company-people", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"];
   if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
-  const { company_name } = req.body;
+  const { company_name, seniorities = [], page = 1, per_page = 10 } = req.body;
   if (!company_name) return res.status(400).json({ error: "company_name required" });
 
   try {
-    // Step 1: Get org info first
-    const orgRes  = await fetch("https://api.apollo.io/api/v1/organizations/enrich?" + new URLSearchParams({ domain: company_name }), {
-      headers: { "x-api-key": apolloKey, "Cache-Control": "no-cache" },
-    });
-    const orgData = await orgRes.json();
-    const org = orgData.organization || null;
-
-    // Step 2: Search ALL people at this company (no title filter)
-    const params = new URLSearchParams();
-    params.append("q_organization_name", company_name);
-    params.append("per_page", "25");
-    if (org?.id) params.append("organization_ids[]", org.id);
-
-    const peopleRes  = await fetch(`https://api.apollo.io/api/v1/mixed_people/api_search?${params.toString()}`, {
+    // Step 1: Get org info (use name search not domain)
+    const orgSearchRes = await fetch("https://api.apollo.io/api/v1/mixed_companies/search", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+      body: JSON.stringify({ q_organization_name: company_name, per_page: 1 }),
+    });
+    const orgSearchData = await orgSearchRes.json();
+    const org = orgSearchData.organizations?.[0] || null;
+
+    // Step 2: Search people at this company with optional seniority filter
+    const searchBody = {
+      q_organization_name: company_name,
+      per_page,
+      page,
+    };
+    if (org?.id) searchBody.organization_ids = [org.id];
+    // Map our filter groups to Apollo seniority values
+    if (seniorities.length) searchBody.person_seniorities = seniorities;
+
+    const peopleRes = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+      body: JSON.stringify(searchBody),
     });
     const peopleData = await peopleRes.json();
     const people = (peopleData.people || []).map(p => ({
       apollo_id: p.id,
       name:      p.name || `${p.first_name||""} ${p.last_name||""}`.trim(),
       title:     p.title || "—",
-      email:     p.email || "",
-      phone:     p.phone_numbers?.[0]?.sanitized_number || "",
+      email:     "",   // never returned by search API — requires enrichment
+      phone:     "",
       linkedin:  p.linkedin_url || "",
-      verified:  !!p.email,
       location:  [p.city, p.state, p.country].filter(Boolean).join(", "),
     }));
 
@@ -241,7 +267,136 @@ app.post("/api/apollo/company-people", async (req, res) => {
         industry:  org.industry,
       } : { name: company_name },
       people,
+      total:    peopleData.pagination?.total_entries || people.length,
+      page,
+      per_page,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Apollo Bulk Enrich → auto-save to saved_contacts ──────────
+// Calls Apollo people/bulk_match for up to 10 people, saves results to DB
+app.post("/api/apollo/bulk-enrich", async (req, res) => {
+  const apolloKey = req.headers["x-apollo-key"];
+  if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
+  const { people, source = "person_lookup" } = req.body; // people: [{ apollo_id, name, title, company, domain, linkedin, location }]
+  if (!people?.length) return res.status(400).json({ error: "people array required" });
+
+  try {
+    // Apollo bulk_match accepts up to 10 at a time
+    const details = people.slice(0, 10).map(p => ({
+      id:                    p.apollo_id,
+      reveal_personal_emails: true,
+      reveal_phone_number:   true,
+    }));
+
+    const enrichRes = await fetch("https://api.apollo.io/api/v1/people/bulk_match", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
+      body: JSON.stringify({ details, reveal_personal_emails: true, reveal_phone_number: true }),
+    });
+    const enrichData = await enrichRes.json();
+    const enriched = enrichData.matches || enrichData.people || [];
+
+    // Merge enriched data back with original people list
+    const results = people.slice(0, 10).map((orig, i) => {
+      const e = enriched[i] || {};
+      return {
+        apollo_id: orig.apollo_id,
+        name:      orig.name,
+        title:     orig.title,
+        company:   orig.company,
+        domain:    orig.domain,
+        linkedin:  orig.linkedin,
+        location:  orig.location,
+        email:     e.email || "",
+        phone:     e.phone_numbers?.[0]?.sanitized_number || e.sanitized_phone || "",
+        enriched:  true,
+      };
+    });
+
+    // Auto-save ALL enriched results to saved_contacts (even if no email found)
+    for (const p of results) {
+      await pool.query(
+        `INSERT INTO saved_contacts (apollo_id, name, title, company, domain, email, phone, linkedin, location, source)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT DO NOTHING`,
+        [p.apollo_id, p.name, p.title, p.company, p.domain, p.email, p.phone, p.linkedin, p.location, source]
+      ).catch(() => {/* ignore duplicate errors */});
+    }
+
+    res.json({ results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Saved Contacts ───────────────────────────────────────────
+app.get("/api/contacts", async (req, res) => {
+  try {
+    const { search, has_email, has_phone, source, date_from, date_to, sort = "saved_at", order = "desc" } = req.query;
+    const conditions = [];
+    const params = [];
+    let pi = 1;
+
+    if (search) {
+      conditions.push(`(name ILIKE $${pi} OR email ILIKE $${pi} OR company ILIKE $${pi})`);
+      params.push(`%${search}%`); pi++;
+    }
+    if (has_email === "true")  { conditions.push(`email != ''`); }
+    if (has_phone === "true")  { conditions.push(`phone != ''`); }
+    if (source)                { conditions.push(`source = $${pi}`); params.push(source); pi++; }
+    if (date_from)             { conditions.push(`saved_at >= $${pi}`); params.push(date_from); pi++; }
+    if (date_to)               { conditions.push(`saved_at <= $${pi}`); params.push(date_to); pi++; }
+
+    const where  = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const validSorts  = ["saved_at","name","company","email"];
+    const validOrders = ["asc","desc"];
+    const sortCol  = validSorts.includes(sort)   ? sort  : "saved_at";
+    const sortOrd  = validOrders.includes(order) ? order : "desc";
+
+    const result = await pool.query(
+      `SELECT * FROM saved_contacts ${where} ORDER BY ${sortCol} ${sortOrd}`,
+      params
+    );
+    res.json({ contacts: result.rows, count: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/contacts/bulk-delete", async (req, res) => {
+  const { ids } = req.body;
+  if (!ids?.length) return res.status(400).json({ error: "ids required" });
+  try {
+    await pool.query("DELETE FROM saved_contacts WHERE id = ANY($1::uuid[])", [ids]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/contacts/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM saved_contacts WHERE id = $1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/contacts/export", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT name,title,company,domain,email,phone,linkedin,location,source,saved_at FROM saved_contacts ORDER BY saved_at DESC");
+    const headers = ["Name","Title","Company","Domain","Email","Phone","LinkedIn","Location","Source","Saved At"];
+    const rows = result.rows.map(r => [r.name,r.title,r.company,r.domain,r.email,r.phone,r.linkedin,r.location,r.source,r.saved_at].map(v => `"${(v||"").toString().replace(/"/g,'""')}"`).join(","));
+    const csv = [headers.join(","), ...rows].join("
+");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", "attachment; filename=saved_contacts.csv");
+    res.send(csv);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
