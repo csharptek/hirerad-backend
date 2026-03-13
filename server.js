@@ -94,6 +94,17 @@ async function migrate() {
         saved_at   TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    // Add unique constraint on apollo_id for saved_contacts (safe — won't fail if already exists)
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'saved_contacts_apollo_id_key'
+        ) THEN
+          ALTER TABLE saved_contacts ADD CONSTRAINT saved_contacts_apollo_id_key UNIQUE (apollo_id);
+        END IF;
+      END $$;
+    `).catch(() => {});
+
     // Add columns if they don't exist (safe migration)
     await client.query(`ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS apify_run_id TEXT`);
     await client.query(`ALTER TABLE scrape_runs ADD COLUMN IF NOT EXISTS params JSONB`);
@@ -342,14 +353,25 @@ app.post("/api/apollo/bulk-enrich", async (req, res) => {
       };
     });
 
-    // Auto-save ALL enriched results to saved_contacts (even if no email found)
+    // Log Apollo response for debugging
+    console.log("bulk-enrich: Apollo returned", enriched.length, "matches for", people.slice(0,10).length, "people");
+    results.forEach((r, i) => console.log(`  [${i}] ${r.name} => email:${r.email||"none"} phone:${r.phone||"none"}`));
+
+    // Upsert: insert new or UPDATE email/phone if contact already exists (fixes blank email/phone issue)
     for (const p of results) {
+      if (!p.apollo_id) continue;
       await pool.query(
-        `INSERT INTO saved_contacts (apollo_id, name, title, company, domain, email, phone, linkedin, location, source)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-         ON CONFLICT DO NOTHING`,
+        `INSERT INTO saved_contacts (apollo_id, name, title, company, domain, email, phone, linkedin, location, source, saved_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
+         ON CONFLICT (apollo_id) DO UPDATE SET
+           email    = CASE WHEN EXCLUDED.email != '' THEN EXCLUDED.email ELSE saved_contacts.email END,
+           phone    = CASE WHEN EXCLUDED.phone != '' THEN EXCLUDED.phone ELSE saved_contacts.phone END,
+           name     = EXCLUDED.name,
+           title    = EXCLUDED.title,
+           company  = EXCLUDED.company,
+           saved_at = NOW()`,
         [p.apollo_id, p.name, p.title, p.company, p.domain, p.email, p.phone, p.linkedin, p.location, source]
-      ).catch(() => {/* ignore duplicate errors */});
+      ).catch(err => console.error("save contact error:", err.message));
     }
 
     res.json({ results });
