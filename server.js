@@ -392,8 +392,7 @@ app.get("/api/contacts/export", async (req, res) => {
     const result = await pool.query("SELECT name,title,company,domain,email,phone,linkedin,location,source,saved_at FROM saved_contacts ORDER BY saved_at DESC");
     const headers = ["Name","Title","Company","Domain","Email","Phone","LinkedIn","Location","Source","Saved At"];
     const rows = result.rows.map(r => [r.name,r.title,r.company,r.domain,r.email,r.phone,r.linkedin,r.location,r.source,r.saved_at].map(v => `"${(v||"").toString().replace(/"/g,'""')}"`).join(","));
-    const csv = [headers.join(","), ...rows].join("
-");
+    const csv = [headers.join(","), ...rows].join("\n");
     res.setHeader("Content-Type", "text/csv");
     res.setHeader("Content-Disposition", "attachment; filename=saved_contacts.csv");
     res.send(csv);
