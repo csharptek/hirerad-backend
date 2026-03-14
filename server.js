@@ -252,31 +252,30 @@ app.post("/api/apollo/person-search", async (req, res) => {
 });
 
 // ── Apollo Proxy: Company People ─────────────────────────────
-// Supports seniority filters + pagination
+// Supports seniority filters + pagination. Returns similar companies if 0 people found.
 app.post("/api/apollo/company-people", async (req, res) => {
   const apolloKey = req.headers["x-apollo-key"];
   if (!apolloKey) return res.status(400).json({ error: "Missing Apollo API key" });
-  const { company_name, seniorities = [], page = 1, per_page = 10 } = req.body;
+  const { company_name, company_id, seniorities = [], page = 1, per_page = 10 } = req.body;
   if (!company_name) return res.status(400).json({ error: "company_name required" });
 
   try {
-    // Step 1: Get org info (use name search not domain)
+    // Step 1: Search for matching companies (get top 5 for suggestions)
     const orgSearchRes = await fetch("https://api.apollo.io/api/v1/mixed_companies/search", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "x-api-key": apolloKey },
-      body: JSON.stringify({ q_organization_name: company_name, per_page: 1 }),
+      body: JSON.stringify({ q_organization_name: company_name, per_page: 5 }),
     });
     const orgSearchData = await orgSearchRes.json();
-    const org = orgSearchData.organizations?.[0] || null;
+    const allOrgs = orgSearchData.organizations || [];
+    // If a specific company_id was passed (user clicked a suggestion), use that org
+    const org = company_id
+      ? allOrgs.find(o => o.id === company_id) || allOrgs[0] || null
+      : allOrgs[0] || null;
 
-    // Step 2: Search people at this company with optional seniority filter
-    const searchBody = {
-      q_organization_name: company_name,
-      per_page,
-      page,
-    };
+    // Step 2: Search people at this company
+    const searchBody = { q_organization_name: company_name, per_page, page };
     if (org?.id) searchBody.organization_ids = [org.id];
-    // Map our filter groups to Apollo seniority values
     if (seniorities.length) searchBody.person_seniorities = seniorities;
 
     const peopleRes = await fetch("https://api.apollo.io/api/v1/mixed_people/api_search", {
@@ -289,19 +288,31 @@ app.post("/api/apollo/company-people", async (req, res) => {
       apollo_id: p.id,
       name:      p.name || `${p.first_name||""} ${p.last_name||""}`.trim(),
       title:     p.title || "—",
-      email:     "",   // never returned by search API — requires enrichment
+      email:     "",
       phone:     "",
       linkedin:  p.linkedin_url || "",
       location:  [p.city, p.state, p.country].filter(Boolean).join(", "),
     }));
 
+    // Build similar companies list (all found orgs, for the picker UI)
+    const similar = allOrgs.map(o => ({
+      id:        o.id,
+      name:      o.name,
+      domain:    o.website_url || o.primary_domain || "",
+      employees: o.estimated_num_employees || null,
+      industry:  o.industry || "",
+      logo:      o.logo_url || "",
+    }));
+
     res.json({
       org: org ? {
+        id:        org.id,
         name:      org.name,
         domain:    org.website_url || org.primary_domain,
         employees: org.estimated_num_employees,
         industry:  org.industry,
       } : { name: company_name },
+      similar,           // all candidate companies — shown as picker when 0 people OR always
       people,
       total:    peopleData.pagination?.total_entries || people.length,
       page,
@@ -357,9 +368,15 @@ app.post("/api/apollo/bulk-enrich", async (req, res) => {
     console.log("bulk-enrich: Apollo returned", enriched.length, "matches for", people.slice(0,10).length, "people");
     results.forEach((r, i) => console.log(`  [${i}] ${r.name} => email:${r.email||"none"} phone:${r.phone||"none"}`));
 
-    // Upsert: insert new or UPDATE email/phone if contact already exists (fixes blank email/phone issue)
+    // Only save contacts where Apollo actually found email OR phone
+    // On conflict (same apollo_id): update email/phone only if we now have better data
     for (const p of results) {
       if (!p.apollo_id) continue;
+      const hasData = p.email || p.phone;
+      if (!hasData) {
+        console.log(`  SKIP SAVE: ${p.name} — no email or phone found`);
+        continue;
+      }
       await pool.query(
         `INSERT INTO saved_contacts (apollo_id, name, title, company, domain, email, phone, linkedin, location, source, saved_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
@@ -372,6 +389,7 @@ app.post("/api/apollo/bulk-enrich", async (req, res) => {
            saved_at = NOW()`,
         [p.apollo_id, p.name, p.title, p.company, p.domain, p.email, p.phone, p.linkedin, p.location, source]
       ).catch(err => console.error("save contact error:", err.message));
+      console.log(`  SAVED: ${p.name} email:${p.email||"—"} phone:${p.phone||"—"}`);
     }
 
     res.json({ results });
